@@ -1,4 +1,20 @@
-import { Client, Guild, User, TextChannel } from "discord.js";
+import { Buffer } from "node:buffer";
+import path from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { AttachmentBuilder, Client, Guild, User, TextChannel, VoiceBasedChannel } from "discord.js";
+import {
+  AudioPlayer,
+  AudioPlayerStatus,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  getVoiceConnection,
+  joinVoiceChannel,
+  StreamType,
+  VoiceConnectionStatus
+} from "@discordjs/voice";
+import { PassThrough, Readable } from "node:stream";
+import { FFmpeg, opus as PrismOpus } from "prism-media";
 import { PersonalityDB } from "../database/PersonalityDB";
 import { ChannelManager } from "./ChannelManager";
 import { PersonalityCommand } from "../commands/PersonalityCommand";
@@ -6,11 +22,18 @@ import type { MessageHistoryItem } from "../utils/ConversationHistory";
 import {ConversationHistory} from "../utils/ConversationHistory";
 import { AIService } from "../services/AIService";
 import { ChannelSummarizer } from "../services/ChannelSummarizer";
+import { VoiceService, TTSProvider } from "../services/VoiceService";
+import { VoicePlaybackQueue } from "./VoicePlaybackQueue";
 
 // Types for the mock
 type MockAIService = {
   generateResponse: (messages: MessageHistoryItem[], personality?: string | null) => Promise<string>;
   processImage: (imageURL: string, messages: MessageHistoryItem[], personality?: string | null) => Promise<string>;
+};
+
+type VoicePreference = {
+  mode: "speech" | "ai";
+  language?: string;
 };
 
 export class DiscordBot {
@@ -19,6 +42,12 @@ export class DiscordBot {
   private personalityCommand: PersonalityCommand;
   private aiService: AIService | MockAIService;
   private channelSummarizer: ChannelSummarizer;
+  private voiceService: VoiceService;
+  private voicePlaybackEnabled: boolean;
+  private voiceDebugDir: string;
+  private readonly silenceFrame = Buffer.from([0xf8, 0xff, 0xfe]);
+  private voiceQueue: VoicePlaybackQueue;
+  private userVoicePreferences = new Map<string, VoicePreference>();
   private client: Client | null = null;
 
   constructor(dbPath?: string, mockAIService?: MockAIService) {
@@ -26,26 +55,33 @@ export class DiscordBot {
     this.channelManager = new ChannelManager();
     this.personalityCommand = new PersonalityCommand(this.db);
     
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENROUTER_API_KEY environment variable is required");
+    }
+    
     // Use mock if provided (for testing)
     if (mockAIService) {
       this.aiService = mockAIService;
     } else {
-      // Initialize AI service with OpenRouter API key from environment
-      const apiKey = process.env.OPENROUTER_API_KEY;
-      if (!apiKey) {
-        throw new Error("OPENROUTER_API_KEY environment variable is required");
-      }
-      
       this.aiService = new AIService({ apiKey });
     }
     
     // Initialize ChannelSummarizer with OpenRouter API key from environment
-    const summarizerApiKey = process.env.OPENROUTER_API_KEY;
-    if (!summarizerApiKey) {
-      throw new Error("OPENROUTER_API_KEY environment variable is required for ChannelSummarizer");
-    }
-    
-    this.channelSummarizer = new ChannelSummarizer({ apiKey: summarizerApiKey });
+    this.channelSummarizer = new ChannelSummarizer({ apiKey });
+
+    this.voicePlaybackEnabled = process.env.VOICE_ENABLED === "true";
+    const ttsProvider = (process.env.VOICE_TTS_PROVIDER as TTSProvider) || "openai";
+    const audioFormat = process.env.OPENAI_TTS_FORMAT === "mp3" ? "mp3" : "wav";
+    this.voiceService = new VoiceService({
+      provider: ttsProvider,
+      voice: process.env.OPENAI_TTS_VOICE,
+      format: audioFormat,
+      enabled: true,
+      openAIApiKey: process.env.OPENAI_TTS_API_KEY || process.env.OPENAI_API_KEY
+    });
+    this.voiceDebugDir = path.join(process.cwd(), "debug", "voice");
+    this.voiceQueue = new VoicePlaybackQueue();
   }
 
   // Initialize the bot (would connect to Discord in a real implementation)
@@ -53,9 +89,330 @@ export class DiscordBot {
     console.log("Bot initialized");
   }
 
+  async handleVoiceSpeakCommand(user: User, guild: Guild, text: string, language?: string): Promise<string> {
+    if (!this.client) {
+      throw new Error("Discord client is not ready");
+    }
+
+    if (!this.voiceService.isEnabled()) {
+      return "Voice output is disabled. Please configure VOICE_ENABLED and a valid TTS provider.";
+    }
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) {
+      return "I couldn't find your guild membership. Please try again.";
+    }
+
+    const voiceChannel = member.voice.channel;
+    if (!voiceChannel) {
+      return "You need to join a voice channel first.";
+    }
+
+    const previousPreference = this.userVoicePreferences.get(user.id);
+    const effectiveLanguage = language ?? previousPreference?.language;
+    this.updateVoicePreference(user.id, { mode: "speech", language: effectiveLanguage });
+
+    let audioData: Buffer;
+
+    try {
+      const speechText = this.formatSpeechText(text, effectiveLanguage, true);
+      const result = await this.voiceService.synthesizeSpeech(speechText, null, "wav");
+      audioData = result.buffer;
+    } catch (error: any) {
+      console.error("Unable to synthesize speech:", error);
+      return "Voice output is not configured. Please set VOICE_ENABLED and provide a TTS API key.";
+    }
+
+    this.enqueueVoicePlayback(guild, voiceChannel, audioData);
+
+    if (effectiveLanguage) {
+      return `I'll speak your message in ${voiceChannel.name} using your ${effectiveLanguage} preference as soon as any previous requests finish.`;
+    }
+
+    return `I'll speak your message in ${voiceChannel.name} as soon as any previous requests finish.`;
+  }
+
+  async handleAiVoiceInteraction(user: User, guild: Guild, promptText: string): Promise<string> {
+    if (!this.client) {
+      throw new Error("Discord client is not ready");
+    }
+
+    if (!this.voiceService.isEnabled()) {
+      return "Voice output is disabled. Please configure VOICE_ENABLED and a valid TTS provider.";
+    }
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!member) {
+      return "I couldn't find your guild membership. Please try again.";
+    }
+
+    const voiceChannel = member.voice.channel;
+    if (!voiceChannel) {
+      return "You need to join a voice channel first.";
+    }
+
+    const personality = this.personalityCommand.getPersonality(user.id);
+    const previousPreference = this.userVoicePreferences.get(user.id);
+    const effectiveLanguage = previousPreference?.language;
+    this.updateVoicePreference(user.id, { mode: "ai", language: effectiveLanguage });
+    const history: MessageHistoryItem[] = [
+      {
+        role: "user",
+        content: promptText
+      }
+    ];
+
+    let aiResponse: string;
+    try {
+      aiResponse = await this.generateReply(history, personality);
+    } catch (error) {
+      console.error("Failed to generate AI response for voice command:", error);
+      return "I couldn't generate an AI response right now. Please try again.";
+    }
+
+    let audioData: Buffer;
+    try {
+      const speechText = this.formatSpeechText(aiResponse, effectiveLanguage, false);
+      const result = await this.voiceService.synthesizeSpeech(speechText, personality, "wav");
+      audioData = result.buffer;
+    } catch (error) {
+      console.error("Unable to synthesize AI voice response:", error);
+      return "Voice output is not available right now.";
+    }
+
+    this.enqueueVoicePlayback(guild, voiceChannel, audioData);
+
+    return `Queued AI response in ${voiceChannel.name}: ${aiResponse}`;
+  }
+
   // Set the Discord client (for testing)
   setClient(client: Client): void {
     this.client = client;
+  }
+
+  private async generateReply(
+    historyItems: MessageHistoryItem[],
+    personality?: string | null,
+    imageURL?: string
+  ): Promise<string> {
+    if (imageURL) {
+      return this.aiService.processImage(imageURL, historyItems, personality);
+    }
+
+    return this.aiService.generateResponse(historyItems, personality);
+  }
+
+  private async maybeSpeak(text: string, personality?: string | null): Promise<void> {
+    if (!this.voicePlaybackEnabled) {
+      return;
+    }
+
+    if (!this.voiceService.isEnabled()) {
+      return;
+    }
+
+    try {
+      await this.voiceService.speak(text, personality);
+    } catch (error) {
+      console.error("Failed to play TTS audio:", error);
+    }
+  }
+
+  private createOpusStreamFromWav(wavBuffer: Buffer) {
+    const bufferStream = new PassThrough();
+    bufferStream.end(wavBuffer);
+
+    const pcmStream = new FFmpeg({
+      args: [
+        "-loglevel", "0",
+        "-i", "pipe:0",
+        "-f", "s16le",
+        "-ac", "2",
+        "-ar", "48000"
+      ]
+    });
+
+    const opusEncoder = new PrismOpus.Encoder({
+      rate: 48000,
+      channels: 2,
+      frameSize: 960
+    });
+
+    bufferStream.pipe(pcmStream).pipe(opusEncoder);
+    return opusEncoder;
+  }
+
+  private createSilenceStream(frameCount: number = 5): Readable {
+    const frames = Array.from({ length: frameCount }, () => Buffer.from(this.silenceFrame));
+    return Readable.from(frames);
+  }
+
+  private getLanguagePreference(userId: string): string | undefined {
+    return this.userVoicePreferences.get(userId)?.language;
+  }
+
+  private updateVoicePreference(userId: string, preference: VoicePreference): void {
+    const current = this.userVoicePreferences.get(userId);
+    this.userVoicePreferences.set(userId, {
+      language: preference.language ?? current?.language,
+      mode: preference.mode
+    });
+  }
+
+  private formatSpeechText(text: string, language?: string, exact: boolean = false): string {
+    if (language) {
+      if (exact) {
+        return `Speak the following text verbatim in ${language}:\n${text}`;
+      }
+      return `Please respond in ${language} with the following content:\n${text}`;
+    }
+    return text;
+  }
+
+  private async playAudioBuffer(guild: Guild, voiceChannel: VoiceBasedChannel, audioData: Buffer): Promise<void> {
+    let connection = getVoiceConnection(guild.id);
+
+    if (connection) {
+      const currentChannel = connection.joinConfig.channelId;
+      if (currentChannel !== voiceChannel.id) {
+        connection.destroy();
+        connection = null;
+      }
+    }
+
+    if (!connection) {
+      connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator as any,
+        selfDeaf: false
+      });
+    }
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+
+    const audioPlayer = createAudioPlayer();
+    audioPlayer.on("error", (error) => {
+      console.error("Audio player error:", error);
+    });
+
+    const opusStream = this.createOpusStreamFromWav(audioData);
+    const resource = createAudioResource(opusStream, {
+      inputType: StreamType.Opus
+    });
+    const subscription = connection.subscribe(audioPlayer);
+
+    if (!subscription) {
+      connection.destroy();
+      throw new Error("Unable to subscribe audio player to the voice connection.");
+    }
+
+    audioPlayer.play(resource);
+
+    try {
+      await entersState(audioPlayer, AudioPlayerStatus.Playing, 5_000);
+      await entersState(audioPlayer, AudioPlayerStatus.Idle, 120_000);
+      await this.flushSilenceFrames(audioPlayer);
+    } finally {
+      subscription.unsubscribe();
+      audioPlayer.stop(true);
+    }
+  }
+
+  private async flushSilenceFrames(audioPlayer: AudioPlayer): Promise<void> {
+    try {
+      const silenceStream = this.createSilenceStream();
+      const silenceResource = createAudioResource(silenceStream, {
+        inputType: StreamType.Opus
+      });
+      audioPlayer.play(silenceResource);
+      await entersState(audioPlayer, AudioPlayerStatus.Playing, 1_000);
+      await entersState(audioPlayer, AudioPlayerStatus.Idle, 2_000);
+    } catch (error) {
+      console.warn("Failed to flush silence frames:", error);
+    }
+  }
+
+  private enqueueVoicePlayback(guild: Guild, voiceChannel: VoiceBasedChannel, audioBuffer: Buffer): void {
+    void this.voiceQueue.enqueue(guild.id, async () => {
+      await this.playAudioBuffer(guild, voiceChannel, audioBuffer);
+    });
+  }
+
+  async handleLeaveVoiceCommand(guild: Guild): Promise<string> {
+    const connection = getVoiceConnection(guild.id);
+    if (!connection) {
+      return "I'm not connected to a voice channel right now.";
+    }
+    connection.destroy();
+    return "Disconnected from the voice channel.";
+  }
+
+  private async trySendVoiceAttachment(channel: TextChannel | null, text: string, personality?: string | null): Promise<void> {
+    if (!channel) {
+      return;
+    }
+
+    if (!this.channelManager.isPrivateChatChannel(channel.name)) {
+      return;
+    }
+
+    if (!this.voiceService.isEnabled()) {
+      return;
+    }
+
+    try {
+      const { buffer, format } = await this.voiceService.synthesizeSpeech(text, personality);
+      const fileName = `ai-response-${Date.now()}.${format}`;
+      const attachment = new AttachmentBuilder(buffer, { name: fileName });
+      await channel.send({ files: [attachment] });
+    } catch (error) {
+      console.warn("Failed to send voice attachment:", error);
+    }
+  }
+
+  async handleVoiceDebugCommand(user: User, promptText: string): Promise<string> {
+    if (!this.voiceService.isEnabled()) {
+      return "Voice output is disabled. Set VOICE_ENABLED=true and configure OPENAI_TTS_API_KEY to use this command.";
+    }
+
+    const personality = this.personalityCommand.getPersonality(user.id);
+    const history: MessageHistoryItem[] = [
+      {
+        role: "user",
+        content: promptText
+      }
+    ];
+
+    const aiResponse = await this.generateReply(history, personality);
+    const { buffer, format } = await this.voiceService.synthesizeSpeech(aiResponse, personality);
+
+    await mkdir(this.voiceDebugDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const baseName = `${timestamp}-${user.id}`;
+    const audioPath = path.join(this.voiceDebugDir, `${baseName}.${format}`);
+    await writeFile(audioPath, buffer);
+
+    const metadata = {
+      timestamp,
+      user: {
+        id: user.id,
+        tag: user.tag
+      },
+      prompt: promptText,
+      personality,
+      aiResponse,
+      voice: {
+        provider: this.voiceService.getProvider(),
+        voice: this.voiceService.getVoiceName(),
+        format
+      }
+    };
+
+    const metadataPath = path.join(this.voiceDebugDir, `${baseName}.json`);
+    await writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+
+    return `Saved debug audio and metadata.\nAudio: ${audioPath}\nMetadata: ${metadataPath}`;
   }
 
   // Handle a message from a user
@@ -136,26 +493,18 @@ export class DiscordBot {
       attachment.contentType?.startsWith('image/') && 
       attachment.url
     ) || [];
+
+    const firstImageURL = imageAttachments[0]?.url;
     
     // Get response from AI service
     console.log("Generating AI response...");
     let response: string;
     
     try {
-      if (imageAttachments.length > 0) {
-        // Process the first image with the AI service
-        const imageURL = imageAttachments[0]?.url;
-        if (imageURL) {
-          response = await this.aiService.processImage(imageURL, historyItems, personality);
-        } else {
-          response = "I couldn't process the image attachment.";
-        }
-      } else {
-        // Generate response for text message
-        response = await this.aiService.generateResponse(historyItems, personality);
-      }
-      
+      response = await this.generateReply(historyItems, personality, firstImageURL);
       console.log(`Generated response: ${response.substring(0, 50)}${response.length > 50 ? '...' : ''}`);
+      await this.maybeSpeak(response, personality);
+      await this.trySendVoiceAttachment(channel ?? null, response, personality);
     } finally {
       // Clear typing interval when done (success or error)
       if (typingInterval) {

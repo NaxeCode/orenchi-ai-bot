@@ -2,6 +2,10 @@ import { REST, Routes } from "discord.js";
 import { personalityCommand } from "./commands/personality.command.js";
 import { startAiChatCommand } from "./commands/start-ai-chat.command.js";
 import { endAiChatCommand } from "./commands/end-ai-chat.command.js";
+import { aiVoiceCommand } from "./commands/ai-voice.command.js";
+import { aiSayCommand } from "./commands/ai-say.command.js";
+import { aiDebugVoiceCommand } from "./commands/ai-debug-voice.command.js";
+import { leaveCommand } from "./commands/leave.command.js";
 
 // Load environment variables
 const clientId = process.env.DISCORD_CLIENT_ID;
@@ -16,7 +20,11 @@ if (!clientId || !guildId || !token) {
 const commands = [
   personalityCommand,
   startAiChatCommand,
-  endAiChatCommand
+  endAiChatCommand,
+  aiVoiceCommand,
+  aiSayCommand,
+  aiDebugVoiceCommand,
+  leaveCommand
 ];
 
 const rest = new REST().setToken(token);

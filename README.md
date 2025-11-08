@@ -12,6 +12,8 @@ A conversational AI chatbot for Discord with private, one-on-one conversations a
 - SQLite-based personality storage
 - Dynamic model selection based on message length
 - Slash commands for personality management and chat control
+- Optional voice responses that can both play locally and stream into Discord voice calls
+- Audio attachments in `/start-ai-chat` channels so you can hear responses without joining voice
 - Unique channel names to prevent collisions
 
 ## Architecture
@@ -56,6 +58,11 @@ Current test coverage: 100% across all source files.
 - `/personality [text]` - Set your custom personality for the bot
 - `/start-ai-chat` - Start a new private AI conversation
 - `/end-ai-chat` - End current AI conversation and delete channel
+- `/ai-say <text>` - Queue a direct text-to-speech playback of exactly what you typed (handy when you are muted)
+- `/ai-voice <text>` - Join your current voice channel, generate an AI response via the LLM, and speak that reply aloud
+- `/ai-debug-voice [text]` - Generate a debug voice sample, save the spoken audio and metadata under `debug/voice`, and report the file paths
+- `/leave` - Explicitly disconnect the AI from the voice channel when you're done
+- Automatic text-to-speech playback for regular chat replies when enabled
 
 ### Slash Commands Installation Guide
 
@@ -79,6 +86,10 @@ The bot includes the following slash commands:
 1. `/personality` - Set a custom personality for the AI bot
 2. `/start-ai-chat` - Create a private AI chat channel
 3. `/end-ai-chat` - Delete your private AI chat channel
+4. `/ai-voice` - Have the AI join your voice channel, craft an LLM response, and speak it aloud
+5. `/ai-say` - Repeat exactly what you typed via TTS so muted users can still “talk”
+6. `/ai-debug-voice` - Generate a voice response locally for debugging and dump metadata/audio files
+7. `/leave` - Disconnect the bot from the current voice channel
 
 ##### Deploying Commands
 
@@ -105,6 +116,7 @@ Each command is defined using Discord.js's `SlashCommandBuilder` in separate fil
 - `src/commands/personality.command.ts`
 - `src/commands/start-ai-chat.command.ts`
 - `src/commands/end-ai-chat.command.ts`
+- `src/commands/ai-voice.command.ts`
 
 These definitions specify:
 - Command name
@@ -136,6 +148,11 @@ Common errors:
    - `DISCORD_BOT_TOKEN` - Your Discord bot token
    - `OPENROUTER_API_KEY` - Your OpenRouter API key
    - `RESPOND_TO_PUBLIC_NO_MENTION` (optional) - Set to `true` to enable the bot to process messages with no mentions in public channels. Defaults to `false`.
+   - `VOICE_ENABLED` (optional) - Set to `true` to have the bot speak responses out loud on the host machine
+   - `VOICE_TTS_PROVIDER` (optional) - `openai` (default) or `coqui` (placeholder for future support)
+   - `OPENAI_TTS_API_KEY` - Required when `VOICE_TTS_PROVIDER=openai`; the key never leaves your machine
+   - `OPENAI_TTS_VOICE` (optional) - Voice preset for OpenAI TTS (defaults to `alloy`)
+   - `OPENAI_TTS_FORMAT` (optional) - `wav` (default) or `mp3`
 
 3. Discord OAuth2 Setup:
    When setting up OAuth2 for your Discord bot, you need to configure the proper scopes and permissions.
@@ -178,6 +195,16 @@ Common errors:
    bun test --coverage
    ```
 
+## Voice Playback
+
+- Set `VOICE_ENABLED=true` plus `OPENAI_TTS_API_KEY` to have every AI reply spoken aloud locally using OpenAI's `gpt-4o-mini-tts`.
+- `VOICE_TTS_PROVIDER` is pluggable; only the `openai` provider is wired up today, but the interface allows swapping in Coqui later.
+- The new pipeline is: user text → OpenRouter response (`generateReply`) → OpenAI TTS (`speak`) → OS/Discord audio output. The `/ai-voice` command still streams the same synthesized audio into Discord voice channels.
+- When using `/ai-voice`, ensure the bot has the `Connect` and `Speak` permissions in the target channel and that `ffmpeg` is installed on the host (needed to transcode TTS output to Opus frames for Discord voice).
+- `/ai-debug-voice` writes both the raw audio output and a JSON payload describing the prompt, AI response, personality, and selected voice settings to `debug/voice/<timestamp>-<userId>.*`. This is useful for reproducing or sharing TTS issues without joining a voice channel.
+- `/ai-say` queues literal text-to-speech so muted users can “talk”, whereas `/ai-voice` asks the LLM to craft a reply and then vocalizes it.
+- All voice requests (from both commands) are funneled through a per-guild playback queue to ensure responses play sequentially.
+- `/start-ai-chat` channels automatically receive an attached audio clip of each response (when TTS is configured), so you can listen back asynchronously.
 ---
 
 To install dependencies:

@@ -13,6 +13,7 @@ const channelManager = new ChannelManager();
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages
@@ -50,21 +51,21 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     const response = await bot.handlePersonalityCommand(interaction.user.id, personalityText);
     
     // Send ephemeral response
-    await interaction.reply({ content: response, ephemeral: true });
+    await interaction.reply({ content: response, flags: 64 });
     console.log(`Personality command handled for user: ${interaction.user.tag}`);
   } else if (interaction.commandName === "start-ai-chat") {
     // Handle start-ai-chat command
     if (!interaction.guild) {
       await interaction.reply({
         content: "This command can only be used in a server.",
-        ephemeral: true
+        flags: 64
       });
       return;
     }
     
     console.log(`Starting AI chat for user: ${interaction.user.tag}`);
     const response = await bot.handleStartAiChatCommand(interaction.user, interaction.guild);
-    await interaction.reply({ content: response, ephemeral: true });
+    await interaction.reply({ content: response, flags: 64 });
     console.log(`AI chat started for user: ${interaction.user.tag}`);
   } else if (interaction.commandName === "end-ai-chat") {
     // Handle end-ai-chat command
@@ -108,6 +109,77 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
           console.log(`Could not send error response to user ${interaction.user.tag} (expected error): ${replyError.message}`);
         }
       }
+    }
+  } else if (interaction.commandName === "ai-voice") {
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: "This command can only be used in a server voice channel.",
+        flags: 64
+      });
+      return;
+    }
+
+    const message = interaction.options.getString("text", true);
+    await interaction.deferReply({ flags: 64 });
+    try {
+      const response = await bot.handleAiVoiceInteraction(interaction.user, interaction.guild, message);
+      await interaction.editReply({ content: response });
+    } catch (error) {
+      console.error(`Error handling ai-voice command for user ${interaction.user.tag}:`, error);
+      await interaction.editReply({
+        content: "I couldn't play that audio. Please confirm your OpenRouter voice model supports audio responses and try again."
+      });
+    }
+  } else if (interaction.commandName === "ai-say") {
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: "This command can only be used in a server voice channel.",
+        flags: 64
+      });
+      return;
+    }
+
+    const text = interaction.options.getString("text", true);
+    const language = interaction.options.getString("language") ?? undefined;
+    await interaction.deferReply({ flags: 64 });
+    try {
+      const response = await bot.handleVoiceSpeakCommand(interaction.user, interaction.guild, text, language ?? undefined);
+      await interaction.editReply({ content: response });
+    } catch (error) {
+      console.error(`Error handling ai-say command for user ${interaction.user.tag}:`, error);
+      await interaction.editReply({
+        content: "I couldn't speak that text. Please confirm voice output is configured and try again."
+      });
+    }
+  } else if (interaction.commandName === "ai-debug-voice") {
+    const promptText = interaction.options.getString("text") ?? "Please generate a short sample sentence I can listen to.";
+    await interaction.deferReply({ flags: 64 });
+    try {
+      const response = await bot.handleVoiceDebugCommand(interaction.user, promptText);
+      await interaction.editReply({ content: response });
+    } catch (error) {
+      console.error(`Error handling ai-debug-voice command for user ${interaction.user.tag}:`, error);
+      await interaction.editReply({
+        content: "Voice debug failed. Check the server logs for details."
+      });
+    }
+  } else if (interaction.commandName === "leave") {
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: "This command can only be used in a server voice channel.",
+        flags: 64
+      });
+      return;
+    }
+    try {
+      const response = await bot.handleLeaveVoiceCommand(interaction.guild);
+      await interaction.reply({ content: response, flags: 64 });
+    } catch (error) {
+      console.error(`Error handling leave command for user ${interaction.user.tag}:`, error);
+      await interaction.reply({
+        content: "I couldn't disconnect from voice. Please try again.",
+        flags: 64
+      });
     }
   }
 });
