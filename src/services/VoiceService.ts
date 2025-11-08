@@ -60,12 +60,11 @@ export class VoiceService {
         throw new Error("OpenAI client is not configured.");
       }
 
-      const prompt = this.buildSpokenPrompt(text, personality);
       const format = formatOverride ?? this.audioFormat;
       const response = await this.openaiClient.audio.speech.create({
         model: this.defaultModel,
         voice: this.voiceName,
-        input: prompt,
+        input: text,
         format
       });
 
@@ -117,10 +116,11 @@ export class VoiceService {
     return this.audioFormat;
   }
 
-  private buildSpokenPrompt(text: string, personality?: string | null): string {
-    if (personality) {
-      return `${personality}\n\nRespond with: ${text}`;
-    }
-    return text;
+  setVoice(voice: string): void {
+    this.voiceName = voice;
+  }
+
+  private extractAudioData(response: any): string | null {
+    return null;
   }
 }

@@ -181,6 +181,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         flags: 64
       });
     }
+  } else if (interaction.commandName === "voice") {
+    const preset = interaction.options.getString("preset", true);
+    const response = await bot.handleVoicePresetCommand(preset);
+    await interaction.reply({ content: response, flags: 64 });
   }
 });
 
@@ -228,6 +232,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
   if (message.author.bot) return;
 
   console.log(`Received message from ${message.author.tag} in ${message.channel.type === ChannelType.GuildText ? message.channel.name : 'DM'}: ${message.content}`);
+
+  await bot.handleSpeechModeFollowup(message.author.id, message.content, message.guild ?? null);
 
   // Check if this is a private chat channel
   if (message.channel.type === ChannelType.GuildText &&

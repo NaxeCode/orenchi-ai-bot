@@ -62,6 +62,7 @@ Current test coverage: 100% across all source files.
 - `/ai-voice <text>` - Join your current voice channel, generate an AI response via the LLM, and speak that reply aloud
 - `/ai-debug-voice [text]` - Generate a debug voice sample, save the spoken audio and metadata under `debug/voice`, and report the file paths
 - `/leave` - Explicitly disconnect the AI from the voice channel when you're done
+- `/voice preset:<name>` - Switch the global OpenAI TTS voice preset (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`, `coral`, `verse`, `ballad`, `ash`, `sage`, `marin`, `cedar`)
 - Automatic text-to-speech playback for regular chat replies when enabled
 
 ### Slash Commands Installation Guide
@@ -90,6 +91,7 @@ The bot includes the following slash commands:
 5. `/ai-say` - Repeat exactly what you typed via TTS so muted users can still “talk”
 6. `/ai-debug-voice` - Generate a voice response locally for debugging and dump metadata/audio files
 7. `/leave` - Disconnect the bot from the current voice channel
+8. `/voice` - Change the OpenAI TTS voice preset (alloy, echo, fable, onyx, nova, shimmer, coral, verse, ballad, ash, sage, marin, cedar)
 
 ##### Deploying Commands
 

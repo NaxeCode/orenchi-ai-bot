@@ -34,7 +34,12 @@ type MockAIService = {
 type VoicePreference = {
   mode: "speech" | "ai";
   language?: string;
+  lastVoiceChannelId?: string;
+  lastGuildId?: string;
 };
+
+const SUPPORTED_OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "verse", "ballad", "ash", "sage", "marin", "cedar"] as const;
+type VoiceName = (typeof SUPPORTED_OPENAI_VOICES)[number];
 
 export class DiscordBot {
   private db: PersonalityDB;
@@ -49,6 +54,7 @@ export class DiscordBot {
   private voiceQueue: VoicePlaybackQueue;
   private userVoicePreferences = new Map<string, VoicePreference>();
   private client: Client | null = null;
+  private voicePreset: VoiceName;
 
   constructor(dbPath?: string, mockAIService?: MockAIService) {
     this.db = new PersonalityDB(dbPath);
@@ -71,17 +77,33 @@ export class DiscordBot {
     this.channelSummarizer = new ChannelSummarizer({ apiKey });
 
     this.voicePlaybackEnabled = process.env.VOICE_ENABLED === "true";
+    this.voicePreset = this.normalizeVoicePreset(process.env.OPENAI_TTS_VOICE);
     const ttsProvider = (process.env.VOICE_TTS_PROVIDER as TTSProvider) || "openai";
     const audioFormat = process.env.OPENAI_TTS_FORMAT === "mp3" ? "mp3" : "wav";
     this.voiceService = new VoiceService({
       provider: ttsProvider,
-      voice: process.env.OPENAI_TTS_VOICE,
+      voice: this.voicePreset,
       format: audioFormat,
       enabled: true,
       openAIApiKey: process.env.OPENAI_TTS_API_KEY || process.env.OPENAI_API_KEY
     });
     this.voiceDebugDir = path.join(process.cwd(), "debug", "voice");
     this.voiceQueue = new VoicePlaybackQueue();
+    this.voiceService.setVoice(this.voicePreset);
+  }
+
+  private normalizeVoicePreset(value?: string | null): VoiceName {
+    if (value && SUPPORTED_OPENAI_VOICES.includes(value as VoiceName)) {
+      return value as VoiceName;
+    }
+    return "alloy";
+  }
+
+  async handleVoicePresetCommand(voice: string): Promise<string> {
+    const normalized = this.normalizeVoicePreset(voice);
+    this.voicePreset = normalized;
+    this.voiceService.setVoice(normalized);
+    return `Updated voice preset to **${normalized}**. Future TTS responses will use this voice.`;
   }
 
   // Initialize the bot (would connect to Discord in a real implementation)
@@ -110,12 +132,17 @@ export class DiscordBot {
 
     const previousPreference = this.userVoicePreferences.get(user.id);
     const effectiveLanguage = language ?? previousPreference?.language;
-    this.updateVoicePreference(user.id, { mode: "speech", language: effectiveLanguage });
+    this.updateVoicePreference(user.id, {
+      mode: "speech",
+      language: effectiveLanguage,
+      lastVoiceChannelId: voiceChannel.id,
+      lastGuildId: guild.id
+    });
 
     let audioData: Buffer;
 
     try {
-      const speechText = this.formatSpeechText(text, effectiveLanguage, true);
+      const speechText = this.formatSpeechText(text);
       const result = await this.voiceService.synthesizeSpeech(speechText, null, "wav");
       audioData = result.buffer;
     } catch (error: any) {
@@ -154,7 +181,12 @@ export class DiscordBot {
     const personality = this.personalityCommand.getPersonality(user.id);
     const previousPreference = this.userVoicePreferences.get(user.id);
     const effectiveLanguage = previousPreference?.language;
-    this.updateVoicePreference(user.id, { mode: "ai", language: effectiveLanguage });
+    this.updateVoicePreference(user.id, {
+      mode: "ai",
+      language: effectiveLanguage,
+      lastVoiceChannelId: voiceChannel.id,
+      lastGuildId: guild.id
+    });
     const history: MessageHistoryItem[] = [
       {
         role: "user",
@@ -172,7 +204,7 @@ export class DiscordBot {
 
     let audioData: Buffer;
     try {
-      const speechText = this.formatSpeechText(aiResponse, effectiveLanguage, false);
+      const speechText = this.formatSpeechText(aiResponse);
       const result = await this.voiceService.synthesizeSpeech(speechText, personality, "wav");
       audioData = result.buffer;
     } catch (error) {
@@ -255,17 +287,13 @@ export class DiscordBot {
     const current = this.userVoicePreferences.get(userId);
     this.userVoicePreferences.set(userId, {
       language: preference.language ?? current?.language,
-      mode: preference.mode
+      mode: preference.mode ?? current?.mode ?? "speech",
+      lastVoiceChannelId: preference.lastVoiceChannelId ?? current?.lastVoiceChannelId,
+      lastGuildId: preference.lastGuildId ?? current?.lastGuildId
     });
   }
 
-  private formatSpeechText(text: string, language?: string, exact: boolean = false): string {
-    if (language) {
-      if (exact) {
-        return `Speak the following text verbatim in ${language}:\n${text}`;
-      }
-      return `Please respond in ${language} with the following content:\n${text}`;
-    }
+  private formatSpeechText(text: string): string {
     return text;
   }
 
@@ -337,6 +365,43 @@ export class DiscordBot {
     void this.voiceQueue.enqueue(guild.id, async () => {
       await this.playAudioBuffer(guild, voiceChannel, audioBuffer);
     });
+  }
+
+  private async maybeSpeakUserMessage(userId: string, text: string, guild: Guild | null): Promise<void> {
+    if (!this.voiceService.isEnabled()) {
+      return;
+    }
+
+    const preference = this.userVoicePreferences.get(userId);
+    if (!preference || preference.mode !== "speech") {
+      return;
+    }
+
+    let targetGuild: Guild | null = guild;
+    if (!targetGuild && preference.lastGuildId && this.client) {
+      targetGuild = await this.client.guilds.fetch(preference.lastGuildId).catch(() => null);
+    }
+
+    if (!targetGuild) {
+      return;
+    }
+
+    const member = await targetGuild.members.fetch(userId).catch(() => null);
+    if (!member || !member.voice.channel) {
+      return;
+    }
+
+    const speechText = this.formatSpeechText(text);
+    try {
+      const { buffer } = await this.voiceService.synthesizeSpeech(speechText, null, "wav");
+      this.enqueueVoicePlayback(targetGuild, member.voice.channel, buffer);
+    } catch (error) {
+      console.warn("Failed to TTS user speech-mode message:", error);
+    }
+  }
+
+  async handleSpeechModeFollowup(userId: string, text: string, guild: Guild | null): Promise<void> {
+    await this.maybeSpeakUserMessage(userId, text, guild);
   }
 
   async handleLeaveVoiceCommand(guild: Guild): Promise<string> {
@@ -489,7 +554,7 @@ export class DiscordBot {
     }
     
     // Check if there are image attachments
-    const imageAttachments = attachments?.filter(attachment => 
+    const imageAttachments = attachments?.filter(attachment =>
       attachment.contentType?.startsWith('image/') && 
       attachment.url
     ) || [];

@@ -6,6 +6,7 @@ import { aiVoiceCommand } from "./commands/ai-voice.command.js";
 import { aiSayCommand } from "./commands/ai-say.command.js";
 import { aiDebugVoiceCommand } from "./commands/ai-debug-voice.command.js";
 import { leaveCommand } from "./commands/leave.command.js";
+import { voiceCommand } from "./commands/voice.command.js";
 
 // Load environment variables
 const clientId = process.env.DISCORD_CLIENT_ID;
@@ -24,7 +25,8 @@ const commands = [
   aiVoiceCommand,
   aiSayCommand,
   aiDebugVoiceCommand,
-  leaveCommand
+  leaveCommand,
+  voiceCommand
 ];
 
 const rest = new REST().setToken(token);
