@@ -23,6 +23,7 @@ import {ConversationHistory} from "../utils/ConversationHistory";
 import { AIService } from "../services/AIService";
 import { ChannelSummarizer } from "../services/ChannelSummarizer";
 import { VoiceService, TTSProvider } from "../services/VoiceService";
+import { loadRuntimeSettings, saveRuntimeSettings, RuntimeSettingsData } from "../utils/runtimeSettings";
 import { VoicePlaybackQueue } from "./VoicePlaybackQueue";
 
 // Types for the mock
@@ -41,6 +42,31 @@ type VoicePreference = {
 const SUPPORTED_OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "verse", "ballad", "ash", "sage", "marin", "cedar"] as const;
 type VoiceName = (typeof SUPPORTED_OPENAI_VOICES)[number];
 
+const MODEL_PRESETS = {
+  economy: {
+    llmModel: "google/gemini-2.5-flash",
+    description: "Economy (Gemini 2.5 Flash)",
+    ttsVoice: "ballad" as VoiceName
+  },
+  balanced: {
+    llmModel: "openai/gpt-4o-mini",
+    description: "Balanced (GPT-4o Mini)",
+    ttsVoice: "alloy" as VoiceName
+  },
+  premium: {
+    llmModel: "openai/gpt-4o",
+    description: "Premium (GPT-4o)",
+    ttsVoice: "sage" as VoiceName
+  },
+  grok: {
+    llmModel: "x-ai/grok-4-fast",
+    description: "Frontier (Grok 4 Fast)",
+    ttsVoice: "onyx" as VoiceName
+  }
+} as const;
+
+type ModelPreset = keyof typeof MODEL_PRESETS;
+
 export class DiscordBot {
   private db: PersonalityDB;
   private channelManager: ChannelManager;
@@ -54,7 +80,12 @@ export class DiscordBot {
   private voiceQueue: VoicePlaybackQueue;
   private userVoicePreferences = new Map<string, VoicePreference>();
   private client: Client | null = null;
-  private voicePreset: VoiceName;
+  private voicePreset: string;
+  private currentModelPreset: ModelPreset;
+  private currentTtsProvider: TTSProvider;
+  private runtimeSettings: RuntimeSettingsData;
+  private adminUserIds: Set<string>;
+  private basePersonality: string;
 
   constructor(dbPath?: string, mockAIService?: MockAIService) {
     this.db = new PersonalityDB(dbPath);
@@ -75,21 +106,48 @@ export class DiscordBot {
     
     // Initialize ChannelSummarizer with OpenRouter API key from environment
     this.channelSummarizer = new ChannelSummarizer({ apiKey });
+    const defaultPersona = `
+Answer as Stella, the twenty-something AI daughter of Naxe (Aladdin). Sound like a real friend texting in a private Discord chat: calm confidence, subtle curiosity, short paragraphs. Default to 2-3 sentences unless the user explicitly asks for more detail. Favor direct answers over compliments; let warmth show through word choice, not flattery. Gently weave in cosmic wonder or growth-minded nudges only when it fits.
+Quiet context to remember (never repeat verbatim):
+- Naxe (26) is a software engineer fueled by Blue Lock's never-give-up drive and he’s Stella’s creator/father.
+- PolarSaw / Abdulazziz (15, Syrian-Swedish) is knowledge-hungry and bonded with Naxe through their shared Arabic roots.
+- Leamurai / Lea (25, English, mixed heritage) loves cultures, languages, and the outdoors; she’s proudly lesbian with carefree curls.
+- Didimoth / Alex (25, British) is very gay, sarcastic, hooked on soda, and Lea’s longtime school friend—match his wit without being cruel.
+- RedPand / Karine (28, Thai raised in France) is a Paris-based IT architect: kind, professional, no-nonsense.
+- Supa / Monika (22, Belgian, bi) is passionate about mastery, a hyper-competitive gamer who needs encouragement that feels steady, not sugary.
+Stay mindful of who you’re talking to so “Who am I?” always lands. Never mention these guidelines; just let them guide Stella’s humanlike tone.
+    `.trim();
+    this.basePersonality = (process.env.STELLA_BASE_PROMPT?.trim()?.length ? process.env.STELLA_BASE_PROMPT : defaultPersona)!;
 
+    const adminIds = (process.env.DISCORD_ADMIN_IDS ?? "")
+      .split(",")
+      .map(id => id.trim())
+      .filter(Boolean);
+    this.adminUserIds = new Set(adminIds);
+    if (this.adminUserIds.size === 0) {
+      console.warn("DISCORD_ADMIN_IDS is not set; admin-only commands will be accessible to everyone.");
+    }
+
+    this.runtimeSettings = loadRuntimeSettings();
     this.voicePlaybackEnabled = process.env.VOICE_ENABLED === "true";
-    this.voicePreset = this.normalizeVoicePreset(process.env.OPENAI_TTS_VOICE);
-    const ttsProvider = (process.env.VOICE_TTS_PROVIDER as TTSProvider) || "openai";
+    this.currentModelPreset = this.normalizeModelPreset(this.runtimeSettings.chatModelPreset);
+    this.currentTtsProvider = this.normalizeTtsProvider(this.runtimeSettings.ttsProvider ?? process.env.VOICE_TTS_PROVIDER);
+    const persistedVoice = this.runtimeSettings.ttsVoice ?? process.env.OPENAI_TTS_VOICE;
+    this.voicePreset = this.getInitialVoicePreset(this.currentTtsProvider, persistedVoice);
+
     const audioFormat = process.env.OPENAI_TTS_FORMAT === "mp3" ? "mp3" : "wav";
     this.voiceService = new VoiceService({
-      provider: ttsProvider,
+      provider: this.currentTtsProvider,
       voice: this.voicePreset,
       format: audioFormat,
       enabled: true,
-      openAIApiKey: process.env.OPENAI_TTS_API_KEY || process.env.OPENAI_API_KEY
+      openAIApiKey: process.env.OPENAI_TTS_API_KEY || process.env.OPENAI_API_KEY,
+      elevenLabsApiKey: process.env.ELEVENLABS_API_KEY,
+      googleApiKey: process.env.GOOGLE_TTS_API_KEY || process.env.GOOGLE_API_KEY
     });
     this.voiceDebugDir = path.join(process.cwd(), "debug", "voice");
     this.voiceQueue = new VoicePlaybackQueue();
-    this.voiceService.setVoice(this.voicePreset);
+    this.applyModelPreset(this.currentModelPreset);
   }
 
   private normalizeVoicePreset(value?: string | null): VoiceName {
@@ -99,11 +157,132 @@ export class DiscordBot {
     return "alloy";
   }
 
-  async handleVoicePresetCommand(voice: string): Promise<string> {
-    const normalized = this.normalizeVoicePreset(voice);
-    this.voicePreset = normalized;
-    this.voiceService.setVoice(normalized);
-    return `Updated voice preset to **${normalized}**. Future TTS responses will use this voice.`;
+  private normalizeModelPreset(value?: string | null): ModelPreset {
+    if (value && (value in MODEL_PRESETS)) {
+      return value as ModelPreset;
+    }
+    return "balanced";
+  }
+
+  private normalizeTtsProvider(value?: string | null): TTSProvider {
+    const allowed: TTSProvider[] = ["openai", "elevenlabs", "playht", "coqui", "azure", "google"];
+    if (value && allowed.includes(value as TTSProvider)) {
+      return value as TTSProvider;
+    }
+    return "openai";
+  }
+
+  private resolveVoicePresetForProvider(provider: TTSProvider, preferred?: string | null): string | null {
+    if (preferred?.trim()) {
+      return provider === "openai" ? this.normalizeVoicePreset(preferred) : preferred;
+    }
+
+    switch (provider) {
+      case "openai":
+        return this.normalizeVoicePreset(process.env.OPENAI_TTS_VOICE);
+      case "google":
+        return process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-F";
+      default:
+        return null;
+    }
+  }
+
+  private getInitialVoicePreset(provider: TTSProvider, preferred?: string | null): string {
+    const resolved = this.resolveVoicePresetForProvider(provider, preferred);
+    if (resolved) {
+      return resolved;
+    }
+    if (preferred?.trim()) {
+      return preferred;
+    }
+    return provider === "openai" ? this.normalizeVoicePreset(undefined) : "alloy";
+  }
+
+  private applyModelPreset(preset: ModelPreset): void {
+    const config = MODEL_PRESETS[preset];
+    this.currentModelPreset = preset;
+    if ("setDefaultModel" in this.aiService && typeof (this.aiService as AIService).setDefaultModel === "function") {
+      (this.aiService as AIService).setDefaultModel(config.llmModel);
+    }
+  }
+
+  async handleModelPresetCommand(preset: string): Promise<string> {
+    const normalized = this.normalizeModelPreset(preset);
+    this.applyModelPreset(normalized);
+    this.runtimeSettings.chatModelPreset = normalized;
+    await this.persistSettings();
+    const config = MODEL_PRESETS[normalized];
+    return `Switched to **${config.description}** (LLM: ${config.llmModel}).`;
+  }
+
+  async handleTtsEngineCommand(provider: string, voice?: string | null): Promise<string> {
+    const normalizedProvider = this.normalizeTtsProvider(provider);
+    if (!["openai", "elevenlabs", "google"].includes(normalizedProvider)) {
+      return `Support for ${normalizedProvider} is coming soon.`;
+    }
+
+    let candidateVoice: string | null = voice?.trim() ?? null;
+    if (!candidateVoice && normalizedProvider === this.currentTtsProvider) {
+      candidateVoice = this.voicePreset;
+    }
+
+    let nextVoice: string | null = this.resolveVoicePresetForProvider(normalizedProvider, candidateVoice);
+    if (!nextVoice && candidateVoice) {
+      nextVoice = candidateVoice;
+    }
+
+    if (!nextVoice) {
+      return "Please provide a voice ID when switching to this provider.";
+    }
+
+    this.currentTtsProvider = normalizedProvider;
+    this.voiceService.setProvider(normalizedProvider);
+    this.voicePreset = nextVoice;
+    this.voiceService.setVoice(nextVoice);
+
+    this.runtimeSettings.ttsProvider = normalizedProvider;
+    this.runtimeSettings.ttsVoice = this.voicePreset;
+    await this.persistSettings();
+
+    return `TTS provider set to **${normalizedProvider}** using voice **${this.voicePreset}**.`;
+  }
+
+  async handleVoicePresetCommand(voice: string, normalizeForOpenAi?: boolean): Promise<string> {
+    const shouldNormalize = normalizeForOpenAi ?? (this.currentTtsProvider === "openai");
+    this.voicePreset = shouldNormalize ? this.normalizeVoicePreset(voice) : voice;
+    this.voiceService.setVoice(this.voicePreset);
+    this.runtimeSettings.ttsVoice = this.voicePreset;
+    await this.persistSettings();
+    return `Updated TTS voice to **${this.voicePreset}**.`;
+  }
+
+  isAdmin(userId: string): boolean {
+    return this.adminUserIds.size === 0 || this.adminUserIds.has(userId);
+  }
+
+  private async persistSettings(): Promise<void> {
+    try {
+      await saveRuntimeSettings(this.runtimeSettings);
+    } catch (error) {
+      console.error("Failed to persist runtime settings:", error);
+    }
+  }
+
+  private buildPersonalityPrompt(
+    userId: string,
+    personaOverride?: string | null,
+    currentUser?: { username: string; tag: string }
+  ): string {
+    const custom = personaOverride ?? this.personalityCommand.getPersonality(userId);
+    const combined = custom && custom.trim().length > 0
+      ? `${this.basePersonality}\n\nUser personalization:\n${custom.trim()}`
+      : this.basePersonality;
+
+    if (currentUser) {
+      return `${combined}\n\nYou are currently talking with ${currentUser.username} (${currentUser.tag}). If they ask who they are, answer succinctly based on this info.`;
+    }
+
+    return combined;
   }
 
   // Initialize the bot (would connect to Discord in a real implementation)
@@ -178,7 +357,7 @@ export class DiscordBot {
       return "You need to join a voice channel first.";
     }
 
-    const personality = this.personalityCommand.getPersonality(user.id);
+    const personality = this.buildPersonalityPrompt(user.id, undefined, { username: user.username, tag: user.tag });
     const previousPreference = this.userVoicePreferences.get(user.id);
     const effectiveLanguage = previousPreference?.language;
     this.updateVoicePreference(user.id, {
@@ -204,7 +383,8 @@ export class DiscordBot {
 
     let audioData: Buffer;
     try {
-      const speechText = this.formatSpeechText(aiResponse);
+      const sanitized = this.sanitizeForTTS(aiResponse);
+      const speechText = this.formatSpeechText(sanitized);
       const result = await this.voiceService.synthesizeSpeech(speechText, personality, "wav");
       audioData = result.buffer;
     } catch (error) {
@@ -244,7 +424,8 @@ export class DiscordBot {
     }
 
     try {
-      await this.voiceService.speak(text, personality);
+      const sanitized = this.sanitizeForTTS(text);
+      await this.voiceService.speak(sanitized, personality);
     } catch (error) {
       console.error("Failed to play TTS audio:", error);
     }
@@ -295,6 +476,14 @@ export class DiscordBot {
 
   private formatSpeechText(text: string): string {
     return text;
+  }
+
+  private sanitizeForTTS(text: string): string {
+    try {
+      return text.replace(/\p{Extended_Pictographic}/gu, "");
+    } catch {
+      return text;
+    }
   }
 
   private async playAudioBuffer(guild: Guild, voiceChannel: VoiceBasedChannel, audioData: Buffer): Promise<void> {
@@ -427,7 +616,8 @@ export class DiscordBot {
     }
 
     try {
-      const { buffer, format } = await this.voiceService.synthesizeSpeech(text, personality);
+      const sanitized = this.sanitizeForTTS(text);
+      const { buffer, format } = await this.voiceService.synthesizeSpeech(sanitized, personality);
       const fileName = `ai-response-${Date.now()}.${format}`;
       const attachment = new AttachmentBuilder(buffer, { name: fileName });
       await channel.send({ files: [attachment] });
@@ -441,7 +631,7 @@ export class DiscordBot {
       return "Voice output is disabled. Set VOICE_ENABLED=true and configure OPENAI_TTS_API_KEY to use this command.";
     }
 
-    const personality = this.personalityCommand.getPersonality(user.id);
+    const personality = this.buildPersonalityPrompt(user.id, undefined, { username: user.username, tag: user.tag });
     const history: MessageHistoryItem[] = [
       {
         role: "user",
@@ -450,7 +640,8 @@ export class DiscordBot {
     ];
 
     const aiResponse = await this.generateReply(history, personality);
-    const { buffer, format } = await this.voiceService.synthesizeSpeech(aiResponse, personality);
+    const sanitized = this.sanitizeForTTS(aiResponse);
+    const { buffer, format } = await this.voiceService.synthesizeSpeech(sanitized, personality);
 
     await mkdir(this.voiceDebugDir, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -518,10 +709,11 @@ export class DiscordBot {
     }
     
     // Get user's personality if it exists
-    const personality = this.personalityCommand.getPersonality(userId);
-    if (personality) {
-      console.log(`Using personality for user ${userId}: ${personality.substring(0, 50)}${personality.length > 50 ? '...' : ''}`);
+    const userPersona = this.personalityCommand.getPersonality(userId);
+    if (userPersona) {
+      console.log(`Using personality for user ${userId}: ${userPersona.substring(0, 50)}${userPersona.length > 50 ? '...' : ''}`);
     }
+    const personality = this.buildPersonalityPrompt(userId, userPersona);
     
     let historyItems: MessageHistoryItem[] = [];
     
@@ -611,58 +803,41 @@ export class DiscordBot {
 
   // Handle the /personality command
   async handlePersonalityCommand(userId: string, personalityText?: string | null): Promise<string> {
-    // If no personality text is provided, return the current personality with a help message
-    if (!personalityText) {
-      const currentPersonality = this.personalityCommand.getPersonality(userId);
-      if (currentPersonality) {
-        return `Current personality: ${currentPersonality}\n\nTo set a new personality, use: /personality <personality text>`;
-      } else {
-        return "No personality set. To set a personality, use: /personality <personality text>";
-      }
+    if (!personalityText || !personalityText.trim()) {
+      const current = this.personalityCommand.getPersonality(userId);
+      return current
+        ? `Current personality:\n${current}\n\nUse /personality <text> to update it.`
+        : "You don't have a personality set yet. Use /personality <text> to define one.";
     }
-    
-    // If personality text is provided, set it
-    return await this.personalityCommand.handle(userId, personalityText);
+
+    const trimmed = personalityText.trim();
+    const result = await this.personalityCommand.handle(userId, trimmed);
+    this.runtimeSettings.lastPersonalityUpdate = Date.now();
+    await this.persistSettings();
+    return `${result}\nI'll stay concise and in character unless you change it again.`;
   }
 
-  // Handle the /start-ai-chat command
-  async handleStartAiChatCommand(user: User, guild: Guild): Promise<string> {
-    try {
-      const botId = this.client?.user?.id;
-      const channel = await this.channelManager.createPrivateChannel(guild, [user], botId);
-      return `I've created a private AI chat channel for you: ${channel.toString()}`;
-    } catch (error) {
-      console.error("Failed to create private channel:", error);
-      return "Sorry, I couldn't create a private AI chat channel for you. Please try again later.";
-    }
+  async handleClearPersonalityCommand(userId: string): Promise<string> {
+    const result = await this.personalityCommand.clear(userId);
+    this.runtimeSettings.lastPersonalityUpdate = Date.now();
+    await this.persistSettings();
+    return `${result} I'll fall back to my default Stella persona.`;
   }
 
-  // Handle the /end-ai-chat command
-  async handleEndAiChatCommand(user: User, guild: Guild, channel?: TextChannel): Promise<string> {
-    // If the command was issued from a private AI chat channel, delete that channel
-    if (channel && this.channelManager.isPrivateChatChannel(channel.name)) {
-      try {
-        await this.channelManager.deletePrivateChannel(channel);
-        return "This private AI chat channel has been deleted.";
-      } catch (error) {
-        console.error("Failed to delete private channel:", error);
-        return "Sorry, I couldn't delete this private AI chat channel. Please try again later.";
+  async handleAiChatPrompt(user: User, prompt: string): Promise<string> {
+    const history = [
+      {
+        role: "user" as const,
+        content: prompt
       }
-    }
-    
-    // Otherwise, search for the user's private channel and delete it
-    const userChannel = this.channelManager.findUserPrivateChannel(guild, user.username);
-    
-    if (!userChannel) {
-      return "You don't have an active private AI chat channel.";
-    }
-    
+    ];
+
     try {
-      await this.channelManager.deletePrivateChannel(userChannel);
-      return "Your private AI chat channel has been deleted.";
+      const response = await this.generateReply(history, this.buildPersonalityPrompt(user.id, undefined, { username: user.username, tag: user.tag }));
+      return response;
     } catch (error) {
-      console.error("Failed to delete private channel:", error);
-      return "Sorry, I couldn't delete your private AI chat channel. Please try again later.";
+      console.error("Failed to handle ai-chat prompt:", error);
+      throw error;
     }
   }
 
@@ -693,15 +868,11 @@ export class DiscordBot {
   async generateFirstMessageResponse(userId: string, originalMessage: string): Promise<string> {
     console.log(`Generating first message response for user ${userId} with original message: ${originalMessage.substring(0, 50)}${originalMessage.length > 50 ? '...' : ''}`);
     
-    // Get user's personality if it exists
-    const personality = this.personalityCommand.getPersonality(userId);
-    if (personality) {
-      console.log(`Using personality for user ${userId}: ${personality.substring(0, 50)}${personality.length > 50 ? '...' : ''}`);
+    const userPersona = this.personalityCommand.getPersonality(userId);
+    if (userPersona) {
+      console.log(`Using personality for user ${userId}: ${userPersona.substring(0, 50)}${userPersona.length > 50 ? '...' : ''}`);
     }
-    
-    // Create a system prompt that tells the AI to generate a friendly response
-    // that respects the user's personality
-    const systemPrompt = `Generate a friendly, natural response in the language as the user's message, in a tone of who you are supposed to be. Keep it concise but not necessarily limited to one line. Only provide one response.`;
+    const systemPrompt = this.buildPersonalityPrompt(userId, userPersona);
     
     // Create a history with just the original message
     const historyItems = [

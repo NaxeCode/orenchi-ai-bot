@@ -13,7 +13,7 @@ A conversational AI chatbot for Discord with private, one-on-one conversations a
 - Dynamic model selection based on message length
 - Slash commands for personality management and chat control
 - Optional voice responses that can both play locally and stream into Discord voice calls
-- Audio attachments in `/start-ai-chat` channels so you can hear responses without joining voice
+- Audio attachments in `/ai-chat` interactions so you can hear responses without joining voice
 - Unique channel names to prevent collisions
 
 ## Architecture
@@ -56,13 +56,17 @@ Current test coverage: 100% across all source files.
 ## Commands
 
 - `/personality [text]` - Set your custom personality for the bot
-- `/start-ai-chat` - Start a new private AI conversation
-- `/end-ai-chat` - End current AI conversation and delete channel
+- `/clear-personality` - Reset your custom personality back to Stella's default behavior
+- `/ai-chat <prompt>` - Get an AI response directly in the current channel
 - `/ai-say <text>` - Queue a direct text-to-speech playback of exactly what you typed (handy when you are muted)
 - `/ai-voice <text>` - Join your current voice channel, generate an AI response via the LLM, and speak that reply aloud
 - `/ai-debug-voice [text]` - Generate a debug voice sample, save the spoken audio and metadata under `debug/voice`, and report the file paths
 - `/leave` - Explicitly disconnect the AI from the voice channel when you're done
-- `/voice preset:<name>` - Switch the global OpenAI TTS voice preset (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`, `coral`, `verse`, `ballad`, `ash`, `sage`, `marin`, `cedar`)
+- `/tts-voice voice:<id>` *(admin)* - Switch the global TTS voice preset (OpenAI presets such as `alloy`, or provider-specific IDs)
+- `/chat-model preset:<economy|balanced|premium>` *(admin)* - Choose the chat model preset (Gemini 2.5 Flash, GPT-4o Mini, or GPT-4o)
+- `/tts-engine provider:<openai|elevenlabs|...> voice:[optional]` *(admin)* - Swap the underlying TTS provider (OpenAI, ElevenLabs today; others queued up)
+
+Commands marked *(admin)* require your Discord user ID to be listed in `DISCORD_ADMIN_IDS`.
 - Automatic text-to-speech playback for regular chat replies when enabled
 
 ### Slash Commands Installation Guide
@@ -85,13 +89,15 @@ Before deploying commands, ensure you have:
 The bot includes the following slash commands:
 
 1. `/personality` - Set a custom personality for the AI bot
-2. `/start-ai-chat` - Create a private AI chat channel
-3. `/end-ai-chat` - Delete your private AI chat channel
-4. `/ai-voice` - Have the AI join your voice channel, craft an LLM response, and speak it aloud
-5. `/ai-say` - Repeat exactly what you typed via TTS so muted users can still “talk”
-6. `/ai-debug-voice` - Generate a voice response locally for debugging and dump metadata/audio files
-7. `/leave` - Disconnect the bot from the current voice channel
-8. `/voice` - Change the OpenAI TTS voice preset (alloy, echo, fable, onyx, nova, shimmer, coral, verse, ballad, ash, sage, marin, cedar)
+2. `/clear-personality` - Reset your persona to the default Stella vibe
+3. `/ai-chat` - Ask Stella something directly in any channel
+3. `/ai-voice` - Have the AI join your voice channel, craft an LLM response, and speak it aloud
+4. `/ai-say` - Repeat exactly what you typed via TTS so muted users can still “talk”
+5. `/ai-debug-voice` - Generate a voice response locally for debugging and dump metadata/audio files
+6. `/leave` - Disconnect the bot from the current voice channel
+7. `/tts-voice` *(admin)* - Change the TTS voice preset/ID
+8. `/chat-model` *(admin)* - Toggle between the economy (Gemini 2.5 Flash), balanced (GPT-4o Mini), or premium (GPT-4o) presets
+9. `/tts-engine` *(admin)* - Change the TTS provider (OpenAI, ElevenLabs now; other providers coming soon)
 
 ##### Deploying Commands
 
@@ -116,9 +122,13 @@ The deployment script (`src/deploy-commands.ts`) uses Discord's REST API to regi
 Each command is defined using Discord.js's `SlashCommandBuilder` in separate files:
 
 - `src/commands/personality.command.ts`
-- `src/commands/start-ai-chat.command.ts`
-- `src/commands/end-ai-chat.command.ts`
+- `src/commands/ai-chat.command.ts`
 - `src/commands/ai-voice.command.ts`
+- `src/commands/ai-say.command.ts`
+- `src/commands/tts-voice.command.ts`
+- `src/commands/chat-model.command.ts`
+- `src/commands/tts-engine.command.ts`
+- `src/commands/clear-personality.command.ts`
 
 These definitions specify:
 - Command name
@@ -151,9 +161,14 @@ Common errors:
    - `OPENROUTER_API_KEY` - Your OpenRouter API key
    - `RESPOND_TO_PUBLIC_NO_MENTION` (optional) - Set to `true` to enable the bot to process messages with no mentions in public channels. Defaults to `false`.
    - `VOICE_ENABLED` (optional) - Set to `true` to have the bot speak responses out loud on the host machine
-   - `VOICE_TTS_PROVIDER` (optional) - `openai` (default) or `coqui` (placeholder for future support)
-   - `OPENAI_TTS_API_KEY` - Required when `VOICE_TTS_PROVIDER=openai`; the key never leaves your machine
-   - `OPENAI_TTS_VOICE` (optional) - Voice preset for OpenAI TTS (defaults to `alloy`)
+   - `VOICE_TTS_PROVIDER` (optional) - Initial TTS provider (`openai`, `elevenlabs`, etc.). This can also be changed at runtime with `/tts-engine`.
+   - `OPENAI_TTS_API_KEY` - Required when using OpenAI for speech; the key never leaves your machine
+   - `ELEVENLABS_API_KEY` (optional) - Required if you plan to switch to the ElevenLabs TTS engine
+   - `OPENAI_TTS_VOICE` (optional) - Default OpenAI voice preset (defaults to `alloy`)
+   - `DISCORD_ADMIN_IDS` - Comma-separated list of Discord user IDs allowed to run admin-only commands (`/chat-model`, `/tts-engine`, `/tts-voice`)
+   - `STELLA_BASE_PROMPT` (optional) - Override Stella's baseline system prompt/personality. Falls back to an in-code default if omitted.
+
+   Admin-only changes are persisted to `runtime-settings.json` in the project root. This file is ignored by git and is created automatically the first time you change a preset.
    - `OPENAI_TTS_FORMAT` (optional) - `wav` (default) or `mp3`
 
 3. Discord OAuth2 Setup:
@@ -204,9 +219,10 @@ Common errors:
 - The new pipeline is: user text → OpenRouter response (`generateReply`) → OpenAI TTS (`speak`) → OS/Discord audio output. The `/ai-voice` command still streams the same synthesized audio into Discord voice channels.
 - When using `/ai-voice`, ensure the bot has the `Connect` and `Speak` permissions in the target channel and that `ffmpeg` is installed on the host (needed to transcode TTS output to Opus frames for Discord voice).
 - `/ai-debug-voice` writes both the raw audio output and a JSON payload describing the prompt, AI response, personality, and selected voice settings to `debug/voice/<timestamp>-<userId>.*`. This is useful for reproducing or sharing TTS issues without joining a voice channel.
-- `/ai-say` queues literal text-to-speech so muted users can “talk”, whereas `/ai-voice` asks the LLM to craft a reply and then vocalizes it.
+- `/ai-say` queues literal text-to-speech so muted users can "talk", whereas `/ai-voice` asks the LLM to craft a reply and then vocalizes it.
 - All voice requests (from both commands) are funneled through a per-guild playback queue to ensure responses play sequentially.
-- `/start-ai-chat` channels automatically receive an attached audio clip of each response (when TTS is configured), so you can listen back asynchronously.
+- `/chat-model` presets adjust only the LLM selection, while `/tts-engine` swaps the TTS backend. Use `/tts-voice` afterward to override a provider's default voice.
+- `/ai-chat` responses can include an attached audio clip (when TTS is configured) so you can listen back asynchronously.
 ---
 
 To install dependencies:

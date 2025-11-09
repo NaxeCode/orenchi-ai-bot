@@ -9,4 +9,5 @@ crush.json
 .cursor
 personalities.db
 coverage/
+runtime-settings.json
 

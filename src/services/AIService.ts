@@ -135,6 +135,11 @@ export class AIService {
     this.webSearchService = new WebSearchService(config);
   }
 
+  setDefaultModel(model: string): void {
+    console.log(`AIService default model set to ${model}`);
+    this.defaultModel = model;
+  }
+
   /**
    * Create a chat completion with model-specific options
    */

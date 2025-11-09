@@ -31,6 +31,10 @@ export class PersonalityDB {
     return row?.personality ?? null;
   }
 
+  clearPersonality(userId: string): void {
+    this.db.prepare("DELETE FROM personalities WHERE user_id = ?").run(userId);
+  }
+
   close(): void {
     this.db.close();
   }

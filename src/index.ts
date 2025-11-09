@@ -53,62 +53,18 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     // Send ephemeral response
     await interaction.reply({ content: response, flags: 64 });
     console.log(`Personality command handled for user: ${interaction.user.tag}`);
-  } else if (interaction.commandName === "start-ai-chat") {
-    // Handle start-ai-chat command
-    if (!interaction.guild) {
-      await interaction.reply({
-        content: "This command can only be used in a server.",
-        flags: 64
-      });
-      return;
-    }
-    
-    console.log(`Starting AI chat for user: ${interaction.user.tag}`);
-    const response = await bot.handleStartAiChatCommand(interaction.user, interaction.guild);
+  } else if (interaction.commandName === "clear-personality") {
+    const response = await bot.handleClearPersonalityCommand(interaction.user.id);
     await interaction.reply({ content: response, flags: 64 });
-    console.log(`AI chat started for user: ${interaction.user.tag}`);
-  } else if (interaction.commandName === "end-ai-chat") {
-    // Handle end-ai-chat command
-    if (!interaction.guild) {
-      await interaction.reply({
-        content: "This command can only be used in a server.",
-        flags: 64
-      });
-      return;
-    }
-    
+  } else if (interaction.commandName === "ai-chat") {
+    const prompt = interaction.options.getString("prompt", true);
+    await interaction.deferReply();
     try {
-      console.log(`Ending AI chat for user: ${interaction.user.tag}`);
-      const response = await bot.handleEndAiChatCommand(interaction.user, interaction.guild, interaction.channel as TextChannel);
-      await interaction.reply({ content: response, flags: 64 }); // 64 is the flag for ephemeral
-      console.log(`AI chat ended for user: ${interaction.user.tag}`);
-    } catch (error: any) {
-      // If the channel was deleted, we might get an "Unknown Channel" error (code 10003)
-      // This is expected when deleting the channel and trying to reply, so we don't log it as an error
-      if (error.code !== 10003) {
-        console.error(`Error handling end-ai-chat command for user ${interaction.user.tag}:`, error);
-      } else {
-        console.log(`Channel was deleted before response could be sent to user: ${interaction.user.tag}`);
-      }
-      
-      // Try to send an error response, but don't fail the entire process if this fails
-      try {
-        // If the interaction is still valid (not already replied to and not in a deleted channel)
-        if (!interaction.replied && !interaction.deferred) {
-          await interaction.reply({
-            content: "Sorry, I encountered an error while processing your request.",
-            flags: 64
-          });
-        }
-      } catch (replyError: any) {
-        // If we can't reply (e.g., channel was deleted), just log it at info level
-        // If it's a "Unknown interaction" error (code 10062), this is also expected
-        if (replyError.code !== 10062 && replyError.code !== 10003) {
-          console.error(`Could not send error response to user ${interaction.user.tag}:`, replyError.message);
-        } else {
-          console.log(`Could not send error response to user ${interaction.user.tag} (expected error): ${replyError.message}`);
-        }
-      }
+      const response = await bot.handleAiChatPrompt(interaction.user, prompt);
+      await interaction.editReply(response);
+    } catch (error) {
+      console.error("Error handling ai-chat command:", error);
+      await interaction.editReply("Sorry, I encountered an error while responding.");
     }
   } else if (interaction.commandName === "ai-voice") {
     if (!interaction.guild) {
@@ -181,10 +137,36 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         flags: 64
       });
     }
-  } else if (interaction.commandName === "voice") {
+  } else if (interaction.commandName === "chat-model") {
+    if (!bot.isAdmin(interaction.user.id)) {
+      await interaction.reply({ content: "You do not have permission to adjust the chat model.", flags: 64 });
+      return;
+    }
     const preset = interaction.options.getString("preset", true);
-    const response = await bot.handleVoicePresetCommand(preset);
-    await interaction.reply({ content: response, flags: 64 });
+    await interaction.deferReply({ flags: 64 });
+    const response = await bot.handleModelPresetCommand(preset);
+    await interaction.editReply({ content: response });
+  } else if (interaction.commandName === "tts-engine") {
+    if (!bot.isAdmin(interaction.user.id)) {
+      await interaction.reply({ content: "You do not have permission to adjust the TTS engine.", flags: 64 });
+      return;
+    }
+    const provider = interaction.options.getString("provider", true);
+    const voice = interaction.options.getString("voice");
+    await interaction.deferReply({ flags: 64 });
+    const response = await bot.handleTtsEngineCommand(provider, voice);
+    await interaction.editReply({ content: response });
+  } else if (interaction.commandName === "tts-voice") {
+    if (!bot.isAdmin(interaction.user.id)) {
+      await interaction.reply({ content: "You do not have permission to adjust the TTS voice.", flags: 64 });
+      return;
+    }
+    const subcommand = interaction.options.getSubcommand();
+    const voice = interaction.options.getString("voice", true);
+    await interaction.deferReply({ flags: 64 });
+    const normalize = subcommand === "openai";
+    const response = await bot.handleVoicePresetCommand(voice, normalize);
+    await interaction.editReply({ content: response });
   }
 });
 
